@@ -1,0 +1,123 @@
+-- | This module provides a generic, reusable M-of-N quorum approval workflow.
+-- It is designed for scenarios where an action requires consent from a
+-- minimum number of parties (`M`) out of a larger group (`N`).
+-- This is a foundational component for building secure institutional custody
+-- solutions on Canton, enabling multi-signature controls for critical operations.
+--
+-- The workflow consists of two main states, represented by two templates:
+-- 1. `QuorumApproval`: An active approval request, tracking which parties have approved.
+-- 2. `QuorumApproved`: A proof that the required quorum has been met, which can be
+--    used as a capability token to authorize a subsequent action.
+module Custody.QuorumApproval where
+
+import DA.Set (Set)
+import qualified DA.Set as Set
+import DA.Time (Time)
+
+-- | Represents a successfully completed M-of-N approval.
+-- This contract serves as a "capability token" or proof that can be consumed by other
+-- workflows to proceed with an action on the `payloadCid`. It is the result of
+-- successfully exercising the `Execute` choice on a `QuorumApproval` contract.
+template QuorumApproved p
+  with
+    proposer : Party
+      -- ^ The party who originally proposed the action.
+    approvers : Set Party
+      -- ^ The full set of N parties who were eligible to approve.
+    finalApprovals : Set Party
+      -- ^ The set of M (or more) parties who gave their approval.
+    quorumCount : Int
+      -- ^ The required quorum count (M).
+    description : Text
+      -- ^ A human-readable description of the approved action.
+    payloadCid : ContractId p
+      -- ^ The contract on which the approved action can be performed.
+    approvedAt : Time
+      -- ^ The timestamp when the quorum was confirmed and this proof was created.
+  where
+    signatory proposer, Set.toList finalApprovals
+    -- The proposer and all parties who gave their final approval must sign this
+    -- contract to attest to its validity.
+
+    ensure quorumCount > 0
+      && Set.size finalApprovals >= quorumCount
+      && finalApprovals `Set.isSubsetOf` approvers
+
+-- | A contract representing an M-of-N approval request for a specific payload.
+-- The payload is a contract of type `p` identified by `payloadCid`.
+-- This template tracks the progress of approvals towards meeting the required quorum.
+template QuorumApproval p
+  with
+    proposer : Party
+      -- ^ The party who initiated the approval request.
+    approvers : Set Party
+      -- ^ The set of N parties who are eligible to approve.
+    quorumCount : Int
+      -- ^ The number M of approvals required to reach a quorum.
+    approvals : Set Party
+      -- ^ The set of parties who have already approved. This set grows as
+      -- the `Approve` choice is exercised.
+    description : Text
+      -- ^ A human-readable description of the action being approved.
+    payloadCid : ContractId p
+      -- ^ The contract on which an action will be performed upon successful approval.
+    createdAt : Time
+      -- ^ The timestamp when the approval request was created.
+  where
+    signatory proposer, Set.toList approvers
+    -- The proposer and all potential approvers must be signatories to ensure
+    -- they are aware of and agree to participate in this approval workflow.
+
+    ensure quorumCount > 0
+      && quorumCount <= Set.size approvers
+      && approvals `Set.isSubsetOf` approvers
+
+    -- | Allows an eligible party to cast their approval for the request.
+    -- This choice can only be exercised by a party in the `approvers` set who has
+    -- not already approved.
+    choice Approve : ContractId (QuorumApproval p)
+      with
+        approver : Party
+          -- ^ The party giving their approval.
+      controller approver
+      do
+        assertMsg "Controller must be a designated approver." $
+          approver `Set.member` approvers
+        assertMsg "Approver has already approved this request." $
+          not (approver `Set.member` approvals)
+
+        -- Recreate the contract with the new approver added to the set.
+        create this with
+          approvals = Set.insert approver approvals
+
+    -- | Allows the proposer to finalize the approval process once the quorum is met.
+    -- This choice archives the `QuorumApproval` request and creates a `QuorumApproved`
+    -- contract, which acts as an immutable proof of approval.
+    choice Execute : ContractId (QuorumApproved p)
+      with
+        executionTime: Time
+          -- ^ The current time, to be used as the approval timestamp.
+      controller proposer
+      do
+        let currentApprovalCount = Set.size approvals
+        assertMsg ("Quorum of " <> show quorumCount <> " not yet met. " <>
+                   "Current approvals: " <> show currentApprovalCount) $
+          currentApprovalCount >= quorumCount
+
+        create QuorumApproved with
+          proposer
+          approvers
+          finalApprovals = approvals
+          quorumCount
+          description
+          payloadCid
+          approvedAt = executionTime
+
+    -- | Allows the proposer to cancel the approval request at any time before it
+    -- is executed. This provides a way to withdraw a proposal if it's no longer
+    -- needed or was created in error.
+    choice Cancel : ()
+      controller proposer
+      do
+        -- Archiving the contract is implicit upon successful completion of a consuming choice.
+        pure ()
