@@ -1,0 +1,127 @@
+-- Copyright (c) 2024 Digital Asset (Switzerland) GmbH and/or its affiliates. All rights reserved.
+-- SPDX-License-Identifier: Apache-2.0
+
+module Custody.EmergencyFreeze where
+
+import DA.Set (Set, empty, insert, member, length, toList)
+import DA.Action (assert, assertMsg)
+
+-- | Represents a holding of an asset that can be frozen in an emergency.
+-- Normal operations like 'Transfer' are blocked when 'isFrozen' is true.
+template FreezableAssetHolding
+  with
+    owner: Party
+      -- ^ The beneficial owner of the asset.
+    custodian: Party
+      -- ^ The institutional custodian holding the asset.
+    assetId: Text
+      -- ^ A unique identifier for the asset holding.
+    description: Text
+      -- ^ A human-readable description of the asset (e.g., "100 BTC").
+    isFrozen: Bool
+      -- ^ Flag indicating if the asset is currently frozen.
+    freezeAuthority: Set Party
+      -- ^ The set of parties authorized to initiate an emergency freeze.
+      -- This could be a security operations team.
+    unfreezeApprovers: Set Party
+      -- ^ The set of senior parties required to approve an unfreeze request.
+      -- This is typically a different, more restricted group than the freeze authority.
+    unfreezeQuorum: Int
+      -- ^ The minimum number of approvals from 'unfreezeApprovers' required to unfreeze the asset.
+  where
+    signatory custodian, owner
+
+    observer toList freezeAuthority, toList unfreezeApprovers
+
+    ensure unfreezeQuorum > 0 && unfreezeQuorum <= length unfreezeApprovers
+
+    key (owner, custodian, assetId) : (Party, Party, Text)
+    maintainer key._1, key._2
+
+    -- | A member of the freeze authority can freeze the asset.
+    -- This archives the current unfrozen holding and creates a new, identical one
+    -- but with `isFrozen` set to `True`.
+    choice Freeze : ContractId FreezableAssetHolding
+      with
+        freezer: Party
+          -- ^ The party from the freeze authority initiating the freeze.
+      controller freezer
+      do
+        assert (member freezer freezeAuthority)
+        assertMsg "Asset is already frozen." (not isFrozen)
+        create this with isFrozen = True
+
+    -- | The owner or custodian can initiate the process to unfreeze the asset.
+    -- This creates an 'UnfreezeProposal' that requires M-of-N approval.
+    choice RequestUnfreeze : ContractId UnfreezeProposal
+      controller owner, custodian
+      do
+        assertMsg "Asset is not frozen." isFrozen
+        create UnfreezeProposal with
+          holdingCid = self
+          holding = this
+          approvals = empty
+          unfreezeApprovers = this.unfreezeApprovers
+          unfreezeQuorum = this.unfreezeQuorum
+
+    -- | Example of a business logic choice that is disabled by the freeze.
+    -- The owner can transfer the asset to a new owner, but only if it's not frozen.
+    choice Transfer : ContractId FreezableAssetHolding
+      with
+        newOwner: Party
+      controller owner
+      do
+        assertMsg "Cannot transfer a frozen asset." (not isFrozen)
+        create this with owner = newOwner
+
+-- | A proposal to unfreeze an asset, requiring a quorum of approvals.
+-- This contract manages the M-of-N approval workflow.
+template UnfreezeProposal
+  with
+    holdingCid: ContractId FreezableAssetHolding
+      -- ^ The contract ID of the frozen asset holding.
+    holding: FreezableAssetHolding
+      -- ^ The data of the frozen asset holding.
+    approvals: Set Party
+      -- ^ The set of parties who have already approved the unfreeze request.
+    unfreezeApprovers: Set Party
+      -- ^ The set of required approvers, copied from the holding.
+    unfreezeQuorum: Int
+      -- ^ The required number of approvals, copied from the holding.
+  where
+    signatory holding.custodian, holding.owner
+    observer toList unfreezeApprovers
+
+    -- The proposal is only valid as long as the quorum has not been met.
+    ensure length approvals < unfreezeQuorum
+
+    -- | An authorized approver can approve the unfreeze request.
+    -- If this approval meets the quorum, the asset is unfrozen.
+    -- Otherwise, the proposal is updated with the new approval.
+    choice ApproveUnfreeze : Either (ContractId UnfreezeProposal) (ContractId FreezableAssetHolding)
+      with
+        approver: Party
+      controller approver
+      do
+        assert (member approver unfreezeApprovers)
+        assertMsg ("Approver " <> show approver <> " has already approved.") (not (member approver approvals))
+
+        let newApprovals = insert approver approvals
+        let approvalCount = length newApprovals
+
+        if approvalCount >= unfreezeQuorum
+          then do
+            -- Quorum met: archive the old frozen holding and create a new unfrozen one.
+            archive holdingCid
+            unfrozenCid <- create holding with isFrozen = False
+            return (Right unfrozenCid)
+          else do
+            -- Quorum not yet met: update the proposal with the new approval.
+            updatedProposalCid <- create this with approvals = newApprovals
+            return (Left updatedProposalCid)
+
+    -- | The owner or custodian can withdraw the unfreeze request at any time.
+    choice RejectUnfreeze : ()
+      controller holding.owner, holding.custodian
+      do
+        pure ()
