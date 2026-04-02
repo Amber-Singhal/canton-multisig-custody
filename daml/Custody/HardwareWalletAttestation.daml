@@ -1,0 +1,114 @@
+-- | This module provides a standardized template for requesting and verifying
+-- | attestations from hardware security modules (HSMs) or hardware wallets.
+-- | It is a critical component for institutional custody solutions on Canton,
+-- | ensuring that high-value operations are signed with keys held in secure,
+-- | tamper-resistant hardware.
+-- |
+-- | The workflow is designed to meet stringent security requirements like SOC 2
+-- | and ISO 27001 by providing a clear, auditable on-ledger trail of hardware-signed
+-- | operations and their approvals.
+module Custody.HardwareWalletAttestation where
+
+import DA.Set (Set)
+import qualified DA.Set as Set
+import DA.Optional (isSome, fromOptional)
+
+-- | Represents the cryptographic evidence of an operation signed by a hardware wallet.
+-- | This data is provided by the `hsmProvider` and subsequently verified and approved
+-- | by a set of `attestors`.
+data AttestationEvidence = AttestationEvidence
+  with
+    publicKey: Text
+      -- ^ The public key from the hardware device used for signing, in a standard format (e.g., PEM or HEX).
+    signature: Text
+      -- ^ The cryptographic signature of the `payloadHash`, encoded as Text (e.g., Base64 or HEX).
+    algorithm: Text
+      -- ^ The signature algorithm used (e.g., "ECDSA-secp256k1"), allowing off-ledger systems
+      -- | to correctly verify the signature.
+  deriving (Eq, Show)
+
+-- | A contract representing a request for, and the fulfillment of, a hardware wallet attestation.
+-- |
+-- | The lifecycle is as follows:
+-- | 1. The `operator` creates this contract to request an attestation for a specific operation (`payloadHash`).
+-- | 2. The `hsmProvider` observes this request and uses their hardware to sign the `payloadHash`.
+-- | 3. The `hsmProvider` exercises the `ProvideEvidence` choice, attaching the signature and public key.
+-- | 4. The `attestors` (e.g., members of a quorum) observe the provided evidence.
+-- | 5. Each `attestor` exercises the `ApproveAttestation` choice to validate the evidence. Off-ledger
+-- |    verification of the signature would happen in the attestor's system before exercising this choice.
+-- | 6. Once all approvals are gathered (`approvedBy == attestors`), the `operator` can exercise
+-- |    `ConsumeCompletedAttestation` to use this proof in a downstream process (e.g., executing a transaction),
+-- |    which archives this contract and returns the proof.
+template HardwareWalletAttestation
+  with
+    operator: Party
+      -- ^ The party managing the custody operation, requesting the attestation.
+    hsmProvider: Party
+      -- ^ The party responsible for the hardware wallet/HSM and providing the signature.
+    owner: Party
+      -- ^ The ultimate owner of the asset or subject of the operation.
+    attestors: Set Party
+      -- ^ A set of parties required to review and approve the provided hardware signature.
+    payloadHash: Text
+      -- ^ The hash of the transaction or operation data that needs to be signed by the hardware wallet.
+    evidence: Optional AttestationEvidence
+      -- ^ The signature evidence provided by the HSM provider. Starts as `None`.
+    approvedBy: Set Party
+      -- ^ The set of attestors who have approved the provided evidence.
+  where
+    signatory operator, hsmProvider
+    observer owner, Set.toList attestors
+
+    ensure
+      Set.isSubsetOf approvedBy attestors &&
+      -- Approvals are only valid if evidence has been provided.
+      (case evidence of
+        None -> Set.null approvedBy
+        Some _ -> True)
+
+    key (operator, owner, payloadHash) : (Party, Party, Text)
+    maintainer key._1
+
+    choice ProvideEvidence: ContractId HardwareWalletAttestation
+      -- ^ The HSM provider submits the signature evidence. This can only be done once.
+      with
+        newEvidence: AttestationEvidence
+          -- ^ The signature, public key, and algorithm from the hardware device.
+      controller hsmProvider
+      do
+        assertMsg "Attestation evidence has already been provided." (not $ isSome self.evidence)
+
+        create this with
+          evidence = Some newEvidence
+
+    choice ApproveAttestation: ContractId HardwareWalletAttestation
+      -- ^ An attestor approves the provided signature evidence. Off-ledger verification of the
+      -- | signature against the public key and payload hash should be performed by the attestor's system
+      -- | before calling this choice.
+      with
+        approver: Party
+          -- ^ The party approving the attestation, must be one of the controllers.
+      controller approver
+      do
+        assertMsg "Controller is not a designated attestor." (Set.member approver attestors)
+        assertMsg "Attestor has already approved." (not $ Set.member approver approvedBy)
+        assertMsg "Cannot approve as no evidence has been provided yet." (isSome self.evidence)
+
+        create this with
+          approvedBy = Set.insert approver self.approvedBy
+
+    choice ConsumeCompletedAttestation: (AttestationEvidence, Set Party)
+      -- ^ The operator consumes the fully-approved attestation to proceed with the main operation.
+      -- | This choice archives the contract and returns the evidence for use in a subsequent step.
+      controller operator
+      do
+        let evidence' = fromOptional (error "BUG: Evidence must be provided to consume attestation.") self.evidence
+
+        assertMsg "Attestation has not been fully approved by all required attestors." (attestors == self.approvedBy)
+
+        -- Bind the result before archiving the contract.
+        let result = (evidence', self.approvedBy)
+
+        archive self
+
+        pure result
