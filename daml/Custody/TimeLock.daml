@@ -1,0 +1,140 @@
+-- Copyright (c) 2024 Digital Asset (Switzerland) GmbH and/or its affiliates. All rights reserved.
+-- SPDX-License-Identifier: Apache-2.0
+
+module Custody.TimeLock where
+
+import DA.Time (Time, RelTime, addRelTime)
+import DA.Assert (assertMsg)
+import DA.Internal.LF (convertRelTime)
+
+-- | A proposal to initiate a time-locked action.
+-- This is the first step in a process to enforce a mandatory review period for
+-- sensitive operations. A `requester` proposes an action (defined in `payload`),
+-- which an `approver` (e.g., a custodian or compliance officer) must then
+-- approve to start the time-lock countdown.
+--
+-- type param `p` The type of the payload, which must be a contract template.
+--   This payload contains the details of the action to be executed after the
+--   time-lock expires.
+template TimeLockProposal p
+  with
+    requester : Party
+      -- ^ The party initiating the action.
+    approver : Party
+      -- ^ The party responsible for approving the time-lock.
+    lockDuration : RelTime
+      -- ^ The mandatory review period before the action can be executed.
+    payload : p
+      -- ^ The data payload defining the action to be taken.
+    id : Text
+      -- ^ A unique identifier for this proposal, provided by the requester.
+    description : Text
+      -- ^ A human-readable description of the proposed action.
+  where
+    ensure (lockDuration > convertRelTime 0)
+      -- The lock duration must be a positive amount of time.
+    signatory requester
+    observer approver
+
+    key (requester, approver, id) : (Party, Party, Text)
+    maintainer key._1, key._2
+
+    -- | The `approver` confirms the proposed action, which creates the
+    -- | active `TimeLockedAction` contract and starts the clock.
+    choice Approve : ContractId (TimeLockedAction p)
+      controller approver
+      do
+        now <- getTime
+        let unlockTime = addRelTime now lockDuration
+        create TimeLockedAction with
+          requester
+          approver
+          unlockTime
+          payload
+          id
+          description
+
+    -- | The `approver` rejects the proposed action, archiving the proposal.
+    choice Reject : ()
+      controller approver
+      do
+        pure ()
+
+-- | An active time-locked action that is in its mandatory review ("cooling-off")
+-- | period. Once the `unlockTime` is in the past, the `requester` can execute
+-- | the action. The `approver` can cancel the action at any point before it is
+-- | executed.
+--
+-- type param `p` The type of the payload, which must be a contract template.
+template TimeLockedAction p
+  with
+    requester : Party
+      -- ^ The party who will execute the action after the lock expires.
+    approver : Party
+      -- ^ The party who approved and oversees the time-lock.
+    unlockTime : Time
+      -- ^ The timestamp after which execution is permitted.
+    payload : p
+      -- ^ The data payload defining the action to be taken.
+    id : Text
+      -- ^ The unique identifier for this action.
+    description : Text
+      -- ^ A human-readable description of the action.
+  where
+    signatory requester, approver
+
+    key (requester, approver, id) : (Party, Party, Text)
+    maintainer key._1, key._2
+
+    -- | The `requester` executes the action after the time-lock has expired.
+    -- | This finalizes the process by creating a `TimeLockReceipt`, which serves
+    -- | as a cryptographic proof that the mandatory review period was observed.
+    -- | This receipt can then be consumed by another contract to complete the
+    -- | underlying operation (e.g., a token transfer).
+    choice Execute : ContractId (TimeLockReceipt p)
+      controller requester
+      do
+        now <- getTime
+        assertMsg "Time-lock has not yet expired." (now >= unlockTime)
+        create TimeLockReceipt with
+          requester
+          approver
+          payload
+          id
+          description
+          executionTime = now
+
+    -- | The `approver` can cancel the pending action before it is executed.
+    -- | This is an important security feature, allowing for an emergency stop
+    -- | if the action is discovered to be malicious or erroneous during the
+    -- | review period.
+    choice Cancel : ()
+      controller approver
+      do
+        pure ()
+
+-- | A receipt that serves as a non-repudiable, auditable proof that a
+-- | time-locked action was successfully executed after its mandatory review
+-- | period. This contract is typically consumed by another contract as a
+-- | precondition for performing a sensitive operation.
+--
+-- type param `p` The type of the payload, which must be a contract template.
+template TimeLockReceipt p
+  with
+    requester : Party
+      -- ^ The party who executed the action.
+    approver : Party
+      -- ^ The party who approved the action.
+    payload : p
+      -- ^ The data payload of the executed action.
+    id : Text
+      -- ^ The unique identifier for the action.
+    description : Text
+      -- ^ A human-readable description of the action.
+    executionTime : Time
+      -- ^ The timestamp when the action was executed.
+  where
+    signatory requester, approver
+
+    key (requester, approver, id) : (Party, Party, Text)
+    maintainer key._1, key._2
