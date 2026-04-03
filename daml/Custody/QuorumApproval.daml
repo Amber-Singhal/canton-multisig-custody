@@ -1,41 +1,132 @@
+-- |
+-- Copyright (c) 2024 Digital Asset (Switzerland) GmbH and/or its affiliates. All rights reserved.
+-- SPDX-License-Identifier: Apache-2.0
+--
+
 module Custody.QuorumApproval where
 
-template QuorumApprovalRequest
+import DA.Set (Set)
+import qualified DA.Set as Set
+import DA.Time (Time)
+import DA.Assert (assertMsg)
+
+-- === INTERFACES ===
+
+-- | An interface for any contract that represents an action requiring M-of-N approval.
+-- The `Execute` choice is the action to be performed upon successful approval.
+interface Action where
+  viewtype V
+
+  -- | The custodian responsible for the asset or action. This party will
+  -- be the one to ultimately exercise the `Execute` choice after quorum is met.
+  getCustodian: Party
+
+  -- | Executes the underlying action. This is called by the `QuorumMet` contract.
+  choice Execute : ()
+    controller getCustodian
+    do
+      pure ()
+
+-- === TEMPLATES ===
+
+-- | Represents a proposal for an action that is pending M-of-N approval.
+-- It tracks the required number of approvals, who has approved, and the deadline.
+-- This template is parameterized by the `Action` interface, making it generic
+-- for any type of action that needs quorum approval.
+template (Action t) => QuorumApproval t
   with
-    custodyId  : Text
-    authority  : Party
-    custodians : [Party]
-    threshold  : Int
-    payload    : Text
-    deadline   : Time
+    proposer          : Party          -- ^ The party who proposed the action.
+    custodian         : Party          -- ^ The institutional custodian.
+    quorumSigners     : Set Party      -- ^ The set of parties authorized to approve (the 'N').
+    requiredApprovals : Int            -- ^ The number of required approvals (the 'M').
+    approvers         : Set Party      -- ^ The set of parties who have already approved.
+    payloadCid        : ContractId t   -- ^ The contract representing the action to be executed.
+    deadline          : Time           -- ^ The time by which all approvals must be submitted.
   where
-    signatory authority
-    observer  custodians
+    signatory proposer, custodian
 
-    ensure threshold > 0 && threshold <= length custodians
+    observer Set.toList quorumSigners
 
-    choice GrantApproval : ContractId QuorumApprovalRequest
+    ensure
+      Set.size approvers < requiredApprovals &&
+      requiredApprovals > 0 &&
+      requiredApprovals <= Set.size quorumSigners &&
+      Set.isSubsetOf approvers quorumSigners
+
+    key (proposer, custodian, payloadCid) : (Party, Party, ContractId t)
+    maintainer key._1
+
+    -- | An authorized signer approves the proposed action.
+    -- This choice enforces the deadline. If the approval meets the quorum,
+    -- it transitions the state to `QuorumMet`, ready for execution. Otherwise,
+    -- it updates the list of approvers.
+    choice Approve : ()
       with
-        approver : Party
-        comment  : Text
+        approver : Party -- ^ The party providing the approval.
       controller approver
       do
+        -- Enforce deadline: This is the critical check to prevent stale quorum approvals.
         now <- getTime
-        assertMsg "Approval deadline has passed — request expired" (now <= deadline)
-        assertMsg "Approver is not a registered custodian" (approver `elem` custodians)
-        return self
+        assertMsg "Approval deadline has passed. This proposal can no longer be approved." (now <= deadline)
 
-    choice RevokeApproval : ContractId QuorumApprovalRequest
-      with revoker : Party
-      controller revoker
+        -- Validate approver is an authorized signer and has not already approved.
+        assertMsg "Controller is not in the set of authorized quorum signers." (Set.member approver quorumSigners)
+        assertMsg "Signer has already approved this proposal." (not $ Set.member approver approvers)
+
+        let newApprovers = Set.insert approver approvers
+        if Set.size newApprovers >= requiredApprovals
+        then do
+          -- Quorum met: archive this proposal and create a `QuorumMet` contract.
+          create QuorumMet with
+            proposer
+            custodian
+            approvers = newApprovers
+            payloadCid
+          pure ()
+        else do
+          -- Quorum not yet met: update the proposal with the new approver.
+          create this with approvers = newApprovers
+          pure ()
+
+    -- | The proposer or custodian can cancel the proposal before it is approved or expired.
+    choice Cancel : ()
+      controller proposer, custodian
+      do
+        pure ()
+
+    -- | Any party involved can explicitly expire the proposal after the deadline has passed.
+    -- This is a housekeeping choice to clean up stale contracts from the ledger.
+    choice Expire : ()
+      controller (Set.toList quorumSigners) ++ [proposer, custodian]
       do
         now <- getTime
-        assertMsg "Cannot revoke after deadline" (now <= deadline)
-        return self
+        assertMsg "Proposal cannot be expired before its deadline." (now > deadline)
+        pure ()
 
-    choice ExpireRequest : ()
-      controller authority
+-- | Represents a proposal that has met its M-of-N approval quorum and is ready for execution.
+-- Only the custodian can trigger the final execution of the payload action.
+template (Action t) => QuorumMet t
+  with
+    proposer   : Party          -- ^ The original proposer of the action.
+    custodian  : Party          -- ^ The institutional custodian.
+    approvers  : Set Party      -- ^ The set of parties who approved.
+    payloadCid : ContractId t   -- ^ The contract representing the action to be executed.
+  where
+    signatory proposer, custodian
+
+    observer Set.toList approvers
+
+    key (proposer, custodian, payloadCid) : (Party, Party, ContractId t)
+    maintainer key._1
+
+    -- | The custodian executes the underlying action now that quorum has been met.
+    -- This choice exercises the `Execute` choice on the payload contract.
+    choice ExecutePayload : ()
+      controller custodian
       do
-        now <- getTime
-        assertMsg "Deadline not yet reached" (now > deadline)
-        return ()
+        -- Ensure the controller matches the custodian on the action payload for consistency.
+        action <- fetch payloadCid
+        assertMsg "Controller is not the designated custodian on the payload." (custodian == action.getCustodian)
+
+        exercise payloadCid Execute
+        pure ()
