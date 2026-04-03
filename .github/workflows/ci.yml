@@ -1,0 +1,28 @@
+name: Canton Multisig Custody CI
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+jobs:
+  build-and-test:
+    name: Build and Test Custody Contracts
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Daml SDK
+        run: |
+          curl -sSL https://get.daml.com/ | sh -s 3.1.0
+          echo "$HOME/.daml/bin" >> $GITHUB_PATH
+
+      - name: Build custody library
+        run: daml build
+
+      - name: Run all custody scenario tests
+        run: daml test --color
+
+      - name: Verify BitGo example compiles
+        run: daml build --project-root daml/examples
