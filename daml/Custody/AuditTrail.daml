@@ -1,0 +1,138 @@
+-- Copyright (c) 2024 Digital Asset (Switzerland) GmbH and/or its affiliates. All rights reserved.
+-- SPDX-License-Identifier: Apache-2.0
+
+module Custody.AuditTrail where
+
+import DA.Time (Time)
+
+-- | Represents the type of a specific audited event. This allows for structured
+-- | querying and filtering of the audit trail, which is crucial for compliance
+-- | and reporting standards like SOC 2 and ISO 27001.
+data AuditEventType
+  = AccountCreation     -- ^ A new custody account was created.
+  | AssetIssuance       -- ^ A new asset was issued into custody.
+  | AssetTransferOut    -- ^ An asset was transferred out of custody.
+  | AssetTransferIn     -- ^ An asset was transferred into custody.
+  | PolicyUpdate        -- ^ A governance or operational policy was changed (e.g., whitelists).
+  | QuorumChange        -- ^ The M-of-N quorum for an approval policy was modified.
+  | EmergencyFreeze     -- ^ An account or asset was frozen by an authorized party.
+  | EmergencyUnfreeze   -- ^ An account or asset was unfrozen.
+  | KeyRotation         -- ^ A cryptographic key (e.g., from a hardware wallet) was rotated.
+  | RequestCreation     -- ^ A request for a sensitive operation (e.g., transfer) was created.
+  | RequestApproval     -- ^ A multi-signature request was approved by a signatory.
+  | RequestRejection    -- ^ A multi-signature request was rejected by a signatory.
+  | RequestExecution    -- ^ An approved request was executed.
+  | Other Text          -- ^ A catch-all for custom or less common event types.
+  deriving (Eq, Show, Ord)
+
+-- | A single, immutable entry in the audit trail. Each entry is a self-contained
+-- | record of a significant event on the Canton ledger.
+data AuditEntry = AuditEntry
+  { timestamp : Time
+    -- ^ The exact ledger time the event was recorded, providing a tamper-proof timestamp.
+  , actor : Party
+    -- ^ The party that initiated the action being logged.
+  , eventType : AuditEventType
+    -- ^ The structured type of the event.
+  , details : Text
+    -- ^ A human-readable description of the action, its context, and its outcome.
+  , referenceId : Optional Text
+    -- ^ An optional reference to a related contract ID, transaction ID, or external identifier.
+  } deriving (Eq, Show, Ord)
+
+-- | The central template for maintaining an immutable, append-only audit trail
+-- | for a custodian's operations. This template is designed to meet strict auditability
+-- | requirements by ensuring that once an event is recorded, it cannot be altered or
+-- | removed.
+-- |
+-- | The pattern used is "create-and-archive": adding an entry archives the current
+-- | contract and creates a new one with the updated list of entries. The ledger's
+-- | inherent immutability guarantees the integrity of the full history.
+template AuditTrail
+  with
+    custodian : Party
+      -- ^ The primary entity responsible for the custody operations and this trail.
+    loggers : [Party]
+      -- ^ A list of authorized parties (e.g., operational roles, automated systems)
+      -- ^ that can record events to this trail.
+    auditors : [Party]
+      -- ^ A list of parties (e.g., internal compliance, external auditors)
+      -- ^ who have read-only access to the trail.
+    entries : [AuditEntry]
+      -- ^ The chronologically ordered list of audit events, with the most recent
+      -- ^ entry at the head of the list for efficient prepending.
+  where
+    signatory custodian
+    observer (loggers ++ auditors)
+
+    key custodian : Party
+    maintainer key
+
+    -- | Adds a new event to the audit trail. This is the sole mechanism for appending
+    -- | to the log. The controller must be an authorized logger.
+    choice AddEntry : ContractId AuditTrail
+      with
+        eventType : AuditEventType
+        details : Text
+        referenceId : Optional Text
+      controller loggers
+      do
+        -- The controller of this choice is the party performing the action,
+        -- so we record them as the 'actor'. Daml ensures 'controllers' is a singleton.
+        let actor = head controllers
+
+        -- Get the current ledger time to ensure an accurate, tamper-proof timestamp.
+        t <- getTime
+
+        let newEntry = AuditEntry
+              { timestamp = t
+              , actor = actor
+              , eventType = eventType
+              , details = details
+              , referenceId = referenceId
+              }
+
+        -- Create the new version of the AuditTrail with the new entry prepended.
+        -- This action archives the contract on which the choice is exercised.
+        create this with
+          entries = newEntry :: entries
+
+    -- | Allows the custodian to manage the list of authorized loggers. This administrative
+    -- | action is itself audited, creating a log entry for the change.
+    choice SetLoggers : ContractId AuditTrail
+      with
+        newLoggers : [Party]
+      controller custodian
+      do
+        t <- getTime
+        let
+          entry = AuditEntry
+            { timestamp = t
+            , actor = custodian
+            , eventType = PolicyUpdate
+            , details = "Authorized logger list was updated."
+            , referenceId = None
+            }
+        create this with
+          loggers = newLoggers
+          entries = entry :: entries
+
+    -- | Allows the custodian to manage the list of auditors. This administrative
+    -- | action is also audited.
+    choice SetAuditors : ContractId AuditTrail
+      with
+        newAuditors : [Party]
+      controller custodian
+      do
+        t <- getTime
+        let
+          entry = AuditEntry
+            { timestamp = t
+            , actor = custodian
+            , eventType = PolicyUpdate
+            , details = "Auditor list was updated."
+            , referenceId = None
+            }
+        create this with
+          auditors = newAuditors
+          entries = entry :: entries
