@@ -1,0 +1,83 @@
+module CustodyTest where
+
+import Daml.Script
+import Custody.QuorumApproval
+import Custody.TimeLock
+import Custody.EmergencyFreeze
+import Custody.AuditTrail
+
+test_2of3_quorum : Script ()
+test_2of3_quorum = script do
+  authority <- allocateParty "CustodyAuthority"
+  c1 <- allocateParty "Custodian-BitGo"
+  c2 <- allocateParty "Custodian-Fireblocks"
+  c3 <- allocateParty "Custodian-Anchorage"
+
+  now <- getTime
+
+  -- Create a 2-of-3 quorum approval request
+  qCid <- submit authority do
+    createCmd QuorumApprovalRequest with
+      custodyId   = "transfer-001"
+      authority
+      custodians  = [c1, c2, c3]
+      threshold   = 2
+      payload     = "transfer 5000 CC to Alice::..."
+      deadline    = addRelTime now (days 1)
+
+  -- Two custodians approve (threshold reached)
+  submit c1 do exerciseCmd qCid GrantApproval with approver = c1; comment = "Verified"
+  submit c2 do exerciseCmd qCid GrantApproval with approver = c2; comment = "Verified"
+
+  return ()
+
+test_emergency_freeze : Script ()
+test_emergency_freeze = script do
+  authority <- allocateParty "CustodyAuthority"
+  c1 <- allocateParty "Custodian-A"
+  c2 <- allocateParty "Custodian-B"
+  security <- allocateParty "SecurityOfficer"
+
+  now <- getTime
+
+  -- Security officer initiates emergency freeze
+  freezeCid <- submit security do
+    createCmd EmergencyFreeze with
+      custodyId  = "wallet-treasury-001"
+      initiator  = security
+      authority
+      custodians = [c1, c2]
+      reason     = "Suspicious withdrawal pattern detected"
+      frozenAt   = now
+
+  -- Audit the freeze
+  auditCid <- submit authority do
+    createCmd AuditEvent with
+      custodyId  = "wallet-treasury-001"
+      eventType  = FreezeInitiated
+      actor      = authority
+      custodians = [c1, c2]
+      details    = "Emergency freeze by security officer"
+      occurredAt = now
+
+  return ()
+
+test_timelock_execution : Script ()
+test_timelock_execution = script do
+  authority <- allocateParty "CustodyAuthority"
+  c1 <- allocateParty "Custodian-A"
+  c2 <- allocateParty "Custodian-B"
+
+  now <- getTime
+
+  lockCid <- submit authority do
+    createCmd CustodyTimeLock with
+      custodyId     = "high-value-transfer-001"
+      authority
+      custodians    = [c1, c2]
+      payload       = "transfer 1000000 CC to Counterparty::..."
+      executeAfter  = addRelTime now (hours 48)
+      executeBefore = addRelTime now (hours 72)
+      approvalCount = 2
+
+  return ()
