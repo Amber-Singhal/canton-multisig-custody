@@ -1,0 +1,64 @@
+module BitGoPattern where
+
+-- Example: BitGo-style 2-of-3 institutional custody workflow on Canton.
+-- Models the standard BitGo architecture: client key + BitGo server key + backup key.
+
+import Daml.Script
+import Custody.QuorumApproval
+import Custody.TimeLock
+import Custody.AuditTrail
+
+bitgo_custody_example : Script ()
+bitgo_custody_example = script do
+  authority  <- allocateParty "CustodyAuthority"
+  clientKey  <- allocateParty "ClientKey"      -- User-controlled key
+  bitgoKey   <- allocateParty "BitGoServerKey" -- BitGo server-side key
+  backupKey  <- allocateParty "BackupKey"      -- Cold storage backup
+  compliance <- allocateParty "ComplianceOfficer"
+
+  now <- getTime
+
+  -- Client initiates a withdrawal requiring 2-of-3
+  qCid <- submit authority do
+    createCmd QuorumApprovalRequest with
+      custodyId  = "withdrawal-BTC-20260403-001"
+      authority
+      custodians = [clientKey, bitgoKey, backupKey]
+      threshold  = 2
+      payload    = "transfer 5.0 BTC-wrapped to Alice::..."
+      deadline   = addRelTime now (hours 24)
+
+  -- Client key approves first (user initiates)
+  submit clientKey do
+    exerciseCmd qCid GrantApproval with
+      approver = clientKey
+      comment  = "Withdrawal authorised by account holder"
+
+  -- BitGo server approves after policy checks (velocity, whitelist, etc.)
+  submit bitgoKey do
+    exerciseCmd qCid GrantApproval with
+      approver = bitgoKey
+      comment  = "Passed velocity check, destination is whitelisted"
+
+  -- Quorum of 2 reached — create time-lock for high-value transfer
+  lockCid <- submit authority do
+    createCmd CustodyTimeLock with
+      custodyId     = "withdrawal-BTC-20260403-001"
+      authority
+      custodians    = [clientKey, bitgoKey, backupKey]
+      payload       = "transfer 5.0 BTC-wrapped to Alice::..."
+      executeAfter  = addRelTime now (hours 1)   -- 1h review
+      executeBefore = addRelTime now (hours 25)
+      approvalCount = 2
+
+  -- Audit the approval chain
+  submit authority do
+    createCmd AuditEvent with
+      custodyId  = "withdrawal-BTC-20260403-001"
+      eventType  = QuorumReached
+      actor      = authority
+      custodians = [clientKey, bitgoKey, backupKey]
+      details    = "2-of-3 quorum reached. Time-lock active."
+      occurredAt = now
+
+  return ()
