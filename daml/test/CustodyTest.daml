@@ -1,83 +1,208 @@
 module CustodyTest where
 
 import Daml.Script
+import DA.Time as T
+import DA.Assert
+import DA.Either (fromRight)
+
+-- Project modules to be tested
 import Custody.QuorumApproval
 import Custody.TimeLock
 import Custody.EmergencyFreeze
-import Custody.AuditTrail
+import Custody.AuditTrail -- Assuming an audit trail is created
 
-test_2of3_quorum : Script ()
-test_2of3_quorum = script do
-  authority <- allocateParty "CustodyAuthority"
-  c1 <- allocateParty "Custodian-BitGo"
-  c2 <- allocateParty "Custodian-Fireblocks"
-  c3 <- allocateParty "Custodian-Anchorage"
+-- ====================================================================
+-- Test Setup: Dummy Contracts and Parties
+-- ====================================================================
 
-  now <- getTime
+-- A dummy payload representing an action that requires approval.
+-- The QuorumApproval and TimeLock templates will ultimately trigger
+-- the creation of a DummyActionResult.
+template DummyActionPayload
+  with
+    operator : Party
+    actionDescription : Text
+  where
+    signatory operator
 
-  -- Create a 2-of-3 quorum approval request
-  qCid <- submit authority do
-    createCmd QuorumApprovalRequest with
-      custodyId   = "transfer-001"
-      authority
-      custodians  = [c1, c2, c3]
-      threshold   = 2
-      payload     = "transfer 5000 CC to Alice::..."
-      deadline    = addRelTime now (days 1)
+    choice Execute_Action : ContractId DummyActionResult
+      controller operator
+      do
+        create DummyActionResult with operator, actionDescription, result = "Action executed successfully."
 
-  -- Two custodians approve (threshold reached)
-  submit c1 do exerciseCmd qCid GrantApproval with approver = c1; comment = "Verified"
-  submit c2 do exerciseCmd qCid GrantApproval with approver = c2; comment = "Verified"
+-- The result of a successfully executed action.
+template DummyActionResult
+  with
+    operator : Party
+    actionDescription : Text
+    result : Text
+  where
+    signatory operator
 
-  return ()
+-- A sample asset that can be frozen, to test EmergencyFreeze.
+-- In a real implementation, this asset would implement a 'Freezable' interface
+-- that the EmergencyFreezeControl contract would operate on.
+template ManagedAsset
+  with
+    owner : Party
+    emergencyAdmin : Party
+    assetId : Text
+    isFrozen : Bool
+  where
+    signatory owner, emergencyAdmin
+    key (owner, assetId) : (Party, Text)
+    maintainer key._1
 
-test_emergency_freeze : Script ()
-test_emergency_freeze = script do
-  authority <- allocateParty "CustodyAuthority"
-  c1 <- allocateParty "Custodian-A"
-  c2 <- allocateParty "Custodian-B"
-  security <- allocateParty "SecurityOfficer"
+    choice Transfer : ContractId ManagedAsset
+      with newOwner : Party
+      controller owner
+      do
+        assertMsg "Asset is frozen and cannot be transferred." (not isFrozen)
+        create this with owner = newOwner
 
-  now <- getTime
+-- Helper to set up all necessary parties for the tests.
+setupParties = script do
+  proposer <- allocateParty "Proposer"
+  approver1 <- allocateParty "Approver1"
+  approver2 <- allocateParty "Approver2"
+  approver3 <- allocateParty "Approver3"
+  approver4 <- allocateParty "Approver4"
+  approver5 <- allocateParty "Approver5"
+  emergencyAdmin <- allocateParty "EmergencyAdmin"
+  assetOwner <- allocateParty "AssetOwner"
+  executor <- allocateParty "Executor"
 
-  -- Security officer initiates emergency freeze
-  freezeCid <- submit security do
-    createCmd EmergencyFreeze with
-      custodyId  = "wallet-treasury-001"
-      initiator  = security
-      authority
-      custodians = [c1, c2]
-      reason     = "Suspicious withdrawal pattern detected"
-      frozenAt   = now
+  pure (proposer, [approver1, approver2, approver3, approver4, approver5], emergencyAdmin, assetOwner, executor)
 
-  -- Audit the freeze
-  auditCid <- submit authority do
-    createCmd AuditEvent with
-      custodyId  = "wallet-treasury-001"
-      eventType  = FreezeInitiated
-      actor      = authority
-      custodians = [c1, c2]
-      details    = "Emergency freeze by security officer"
-      occurredAt = now
+-- ====================================================================
+-- Test Suite
+-- ====================================================================
 
-  return ()
+custodyTests = script do
+  (proposer, allApprovers, emergencyAdmin, assetOwner, executor) <- setupParties
+  let (approver1, approver2, approver3, approver4, approver5) = (allApprovers[0], allApprovers[1], allApprovers[2], allApprovers[3], allApprovers[4])
 
-test_timelock_execution : Script ()
-test_timelock_execution = script do
-  authority <- allocateParty "CustodyAuthority"
-  c1 <- allocateParty "Custodian-A"
-  c2 <- allocateParty "Custodian-B"
+  testGroup "Canton Custody Library Tests" do
+    -- Tests the QuorumApproval module for a 2-of-3 scenario.
+    test "2-of-3 Quorum Approval Success" do
+      let approvers = [approver1, approver2, approver3]
+      payloadCid <- create proposer (DummyActionPayload proposer "Transfer 100 BTC")
 
-  now <- getTime
+      -- Create the Quorum Approval agreement.
+      quorumCid <- submit proposer do
+        create QuorumApproval with
+          proposer
+          approvers
+          quorumSize = 2
+          payloadCid = toAnyContractId payloadCid
+          payloadInterface = "DummyActionPayload"
+          payloadExecuteChoice = "Execute_Action"
+          approvedBy = []
 
-  lockCid <- submit authority do
-    createCmd CustodyTimeLock with
-      custodyId     = "high-value-transfer-001"
-      authority
-      custodians    = [c1, c2]
-      payload       = "transfer 1000000 CC to Counterparty::..."
-      executeAfter  = addRelTime now (hours 48)
-      executeBefore = addRelTime now (hours 72)
-      approvalCount = 2
+      -- First approval: returns a Left with the CID of the updated QuorumApproval contract.
+      approvalResult1 <- exercise approver1 (Approve quorumCid)
+      quorumCid_1 <- case approvalResult1 of
+        Left cid -> pure cid
+        Right _ -> fail "Test failed: Expected continuation, but got execution on first approval."
+      updatedQuorum <- fetch quorumCid_1
+      assertEq (length updatedQuorum.approvedBy) 1
 
-  return ()
+      -- Second approval: meets quorum, returns a Right with the CID of the final executed action.
+      approvalResult2 <- exercise approver2 (Approve quorumCid_1)
+      resultCid <- case approvalResult2 of
+        Right cid -> fromInterfaceContractId @DummyActionResult cid
+        Left _ -> fail "Test failed: Expected execution, but got continuation on second approval."
+      result <- fetch resultCid
+      assertEq result.actionDescription "Transfer 100 BTC"
+      
+      (query @QuorumApproval [proposer] `shouldReturn` [])
+
+    -- Tests the QuorumApproval module for a 3-of-5 scenario.
+    test "3-of-5 Quorum Approval" do
+      let approvers = allApprovers
+      payloadCid <- create proposer (DummyActionPayload proposer "Update Vault Policy")
+      quorumCid <- submit proposer do
+        create QuorumApproval with
+          proposer
+          approvers
+          quorumSize = 3
+          payloadCid = toAnyContractId payloadCid
+          payloadInterface = "DummyActionPayload"
+          payloadExecuteChoice = "Execute_Action"
+          approvedBy = []
+
+      -- Approvals 1 and 2
+      Left quorumCid_1 <- exercise approver1 (Approve quorumCid)
+      Left quorumCid_2 <- exercise approver2 (Approve quorumCid_1)
+      (query @DummyActionResult [proposer] `shouldReturn` [])
+
+      -- Third approval meets the quorum.
+      Right resultInterfaceCid <- exercise approver3 (Approve quorumCid_2)
+      resultCid <- fromInterfaceContractId @DummyActionResult resultInterfaceCid
+      result <- fetch resultCid
+      assertEq result.result "Action executed successfully."
+      (query @QuorumApproval [proposer] `shouldReturn` [])
+
+    -- Tests the EmergencyFreeze module.
+    test "Emergency Freeze and Unfreeze" do
+      assetCid <- create assetOwner (ManagedAsset with owner=assetOwner, emergencyAdmin, assetId="BTC-VAULT-01", isFrozen=False)
+      freezeControlCid <- create emergencyAdmin (EmergencyFreezeControl with admin=emergencyAdmin, targetCid=toAnyContractId assetCid, targetFreezeChoice="FreezeAsset", targetUnfreezeChoice="UnfreezeAsset")
+
+      -- Admin freezes the asset. Choice should return the CID of the new, frozen asset contract.
+      frozenAssetCid <- fromInterfaceContractId @ManagedAsset <$> exercise emergencyAdmin (Freeze freezeControlCid)
+      frozenAsset <- fetch frozenAssetCid
+      assert frozenAsset.isFrozen
+
+      -- Attempting to transfer the frozen asset must fail.
+      bob <- allocateParty "Bob"
+      submitMustFail do exercise frozenAssetCid (Transfer bob)
+
+      -- To unfreeze, a new control contract targeting the frozen asset's CID is needed.
+      unfreezeControlCid <- create emergencyAdmin (EmergencyFreezeControl with admin=emergencyAdmin, targetCid=toAnyContractId frozenAssetCid, targetFreezeChoice="FreezeAsset", targetUnfreezeChoice="UnfreezeAsset")
+      unfrozenAssetCid <- fromInterfaceContractId @ManagedAsset <$> exercise emergencyAdmin (Unfreeze unfreezeControlCid)
+      unfrozenAsset <- fetch unfrozenAssetCid
+      assert (not unfrozenAsset.isFrozen)
+
+      -- Transfer of the unfrozen asset should now succeed.
+      transferredAssetCid <- exercise assetOwner (Transfer unfrozenAssetCid with newOwner=bob)
+      assertEq transferredAssetCid.owner bob
+
+    -- Tests the TimeLock module.
+    test "TimeLock Success and Failure" do
+      initialTime <- getTime
+      let unlockTime = T.addRelTime initialTime (T.seconds 10)
+      payloadCid <- create executor (DummyActionPayload executor "Execute quarterly settlement")
+
+      timeLockCid <- create executor (TimeLock with executor, unlockTime, payloadCid = toAnyContractId payloadCid, payloadInterface="DummyActionPayload", payloadExecuteChoice="Execute_Action")
+
+      -- Attempting to execute before unlockTime must fail.
+      submitMustFail do exercise timeLockCid Execute
+
+      -- Advance ledger time past the unlock time.
+      passTime (T.seconds 11)
+
+      -- Now, execution should succeed.
+      resultInterfaceCid <- exercise timeLockCid Execute
+      resultCid <- fromInterfaceContractId @DummyActionResult resultInterfaceCid
+      result <- fetch resultCid
+      assertEq result.actionDescription "Execute quarterly settlement"
+
+      (query @TimeLock [executor] `shouldReturn` [])
+
+    -- Tests the rejection functionality of the QuorumApproval module.
+    test "Quorum Rejection Archives Agreement" do
+      let approvers = [approver1, approver2, approver3]
+      payloadCid <- create proposer (DummyActionPayload proposer "Risky Trade")
+      quorumCid <- submit proposer do
+        create QuorumApproval with
+          proposer, approvers, quorumSize=2, payloadCid=toAnyContractId payloadCid,
+          payloadInterface="DummyActionPayload", payloadExecuteChoice="Execute_Action", approvedBy=[]
+
+      -- One approver rejects, which should cancel and archive the agreement.
+      exercise approver2 (Reject quorumCid)
+
+      (query @QuorumApproval [proposer] `shouldReturn` [])
+      (query @DummyActionResult [proposer] `shouldReturn` [])
+      -- Optional: Verify an AuditEvent for the rejection was created
+      [(_, auditEvent)] <- query @AuditEvent [proposer, approver2]
+      assert $ "Rejected" `T.isInfixOf` auditEvent.description
