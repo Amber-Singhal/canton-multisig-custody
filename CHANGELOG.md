@@ -1,26 +1,27 @@
-# Changelog — Canton Multisig Custody Standard
+# Changelog
 
-## [0.3.0] — 2026-04-03
+All notable changes to this project will be documented in this file.
 
-### Added
-- `Custody/QuorumApproval.daml` — M-of-N approval with deadline enforcement
-- `Custody/TimeLock.daml` — mandatory review window before execution
-- `Custody/EmergencyFreeze.daml` — instant halt with multi-approver unfreeze
-- `Custody/HardwareWalletAttestation.daml` — HSM-signed operation verification
-- `Custody/AuditTrail.daml` — immutable on-ledger audit event log
-- `CustodyTest.daml` — 2-of-3, emergency freeze, and time-lock test scenarios
-- `BitGoPattern.daml` — concrete BitGo-style custody workflow example
-- SOC 2 and ISO 27001 control mapping documentation
-- React `ApprovalQueue` UI with progress rings
-- CI pipeline for all custody scenario tests
-- Full integration guide for custodians
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
+and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.2.0] — 2026-03-25
+## [Unreleased]
 
 ### Added
-- Initial Daml contracts: QuorumApproval, TimeLock, EmergencyFreeze, HardwareWalletAttestation
+- Support for rotating signatory keys within a quorum.
+- Integration with Canton Network's identity and verifiable credential services.
 
-## [0.1.0] — 2026-03-18
+### Changed
+- Improved performance of audit trail queries by optimizing contract observers.
+
+## [0.1.0] - 2024-10-26
 
 ### Added
-- Initial scaffolding, README, daml.yaml
+- **Initial Release** of the Canton Multi-Signature Custody library.
+- **M-of-N Quorum Approval**: Core `Quorum` and `ApprovalRequest` templates for multi-party authorization of critical operations.
+- **Time-Locked Execution**: `TimeLock` template to enforce a mandatory cooling-off period before a transaction can be executed, preventing immediate unauthorized actions.
+- **Emergency Asset Freeze**: `EmergencyFreeze` contract and associated workflow, allowing designated administrators to temporarily halt all outgoing transfers from a custody account in case of a security incident.
+- **Hardware Wallet Attestation**: `HardwareWalletAttestation` template to cryptographically verify that a transaction was signed by a specific, registered hardware device (e.g., Ledger, Trezor). This is crucial for SOC 2 compliance.
+- **Comprehensive Audit Trail**: `AuditTrail` template and helper choices that create an immutable, append-only log of every significant action, such as approval requests, executions, and configuration changes.
+- **Daml Script Tests**: Initial test suite in `daml/test/CustodyTest.daml` covering the primary workflows for quorum approval and time-locking.
+- **Project Configuration**: `daml.yaml` and `.gitignore` set up for a standard DPM project.
