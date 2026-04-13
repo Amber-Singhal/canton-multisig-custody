@@ -1,0 +1,226 @@
+-- Copyright (c) 2024 Digital Asset (Switzerland) GmbH and/or its affiliates. All rights reserved.
+-- SPDX-License-Identifier: Apache-2.0
+
+module Custody.PolicyEngine where
+
+import DA.Set (Set)
+import qualified DA.Set as Set
+import DA.Map (Map)
+import qualified DA.Map as Map
+import DA.Time (Time, RelTime, subTime)
+import DA.Assert
+
+-- | A generic identifier for an asset, e.g., "BTC", "USD", or an ISIN.
+type AssetId = Text
+
+-- | Defines an M-of-N approval requirement.
+-- The total number of approvers (N) is defined in the `Policy` contract itself.
+data QuorumRule = QuorumRule
+  { requiredApprovals : Int -- ^ The minimum number of approvals required (M).
+  } deriving (Eq, Show, Ord)
+
+-- | Defines a mandatory delay between the proposal of a transaction and its
+-- final approval and execution. This provides a window to detect and cancel
+-- fraudulent transactions.
+data TimeLockRule = TimeLockRule
+  { delay : RelTime -- ^ The minimum duration that must pass after proposal.
+  } deriving (Eq, Show, Ord)
+
+-- | Defines a rule restricting transfers to a pre-approved set of destination
+-- parties. This is a critical security control to prevent unauthorized fund
+-- exfiltration.
+data WhitelistRule = WhitelistRule
+  { allowedDestinations: Set Party -- ^ The set of approved destination parties.
+  } deriving (Eq, Show, Ord)
+
+-- | A sum type representing all possible policy rules that can be applied to a
+-- transaction. This design allows for easy extension with new rule types in the future.
+data Rule
+  = Quorum QuorumRule
+  | TimeLock TimeLockRule
+  | Whitelist WhitelistRule
+  deriving (Eq, Show, Ord)
+
+-- | A structured representation of a transaction's details. In a production
+-- system, this could be a more complex variant type to handle different kinds of
+-- transactions (e.g., transfers, atomic swaps, governance actions).
+data TransactionPayload = TransactionPayload
+  { assetId : AssetId     -- ^ The identifier of the asset being transacted.
+  , amount : Decimal      -- ^ The amount of the asset.
+  , destination : Party   -- ^ The recipient party of the transaction.
+  , description : Text    -- ^ A human-readable description of the transaction's purpose.
+  } deriving (Eq, Show, Ord)
+
+-- | The central policy contract. It represents a binding agreement between a
+-- custodian and an asset owner, defining the complete set of rules for authorizing
+-- transactions for various assets.
+template Policy
+  with
+    custodian: Party         -- ^ The party providing custody services.
+    owner: Party             -- ^ The owner of the assets governed by this policy.
+    policyId: Text           -- ^ A unique identifier for this policy.
+    approvers: Set Party     -- ^ The set of parties authorized to approve transactions (N).
+    -- | A map from an asset identifier to the list of rules that apply to it.
+    -- An empty Text `""` can be used as a key for a default policy that applies
+    -- to any asset not explicitly listed.
+    rulesMap: Map AssetId [Rule]
+  where
+    signatory custodian, owner
+    observer Set.toList approvers
+
+    key (custodian, owner, policyId) : (Party, Party, Text)
+    maintainer key._1
+
+    -- | Retrieves the list of rules for a given asset, falling back to the default
+    -- rule set if no asset-specific rules are found.
+    let getRulesFor: AssetId -> [Rule] = \assetId ->
+          case Map.lookup assetId rulesMap of
+            Some rules -> rules
+            None -> fromOptional [] (Map.lookup "" rulesMap)
+
+    -- | Propose a transaction to be governed by this policy.
+    -- This creates a `PendingTransaction` contract, initiating the approval workflow.
+    choice ProposeTransaction : ContractId PendingTransaction
+      with
+        proposer: Party
+        payload: TransactionPayload
+        creationTime: Time
+      controller proposer
+      do
+        -- The proposer must be an authorized party, typically the asset owner.
+        -- More complex schemes could allow designated operators.
+        assertMsg "Proposer must be the owner of the policy" $
+          proposer == owner
+
+        -- Perform pre-flight checks that can be validated at proposal time.
+        -- Whitelist validation is a good candidate for an early check.
+        let rules = getRulesFor payload.assetId
+        forA_ rules \case
+          Whitelist rule ->
+            assertMsg ("Destination " <> show payload.destination <> " is not in the whitelist") $
+              Set.member payload.destination rule.allowedDestinations
+          _ -> return () -- Other rules are checked upon final approval.
+
+        create PendingTransaction with
+          policyCid = self
+          policy = this
+          ..
+
+-- | Represents a transaction that has been proposed and is awaiting approvals
+-- and the satisfaction of other policy rules like time-locks.
+template PendingTransaction
+  with
+    policyCid: ContractId Policy -- ^ Reference to the governing policy.
+    policy: Policy               -- ^ A copy of the policy data for easy access.
+    proposer: Party              -- ^ The party who initiated the transaction proposal.
+    payload: TransactionPayload  -- ^ The details of the proposed transaction.
+    creationTime: Time           -- ^ The timestamp of the proposal.
+    approvals: Set Party         -- ^ The set of parties who have approved so far.
+  where
+    signatory proposer, policy.custodian
+    observer policy.owner, Set.toList policy.approvers
+
+    -- | An approver from the policy's approver set exercises this choice to cast their vote.
+    -- If this approval meets all policy conditions (quorum, time-lock, etc.), the
+    -- transaction is atomically transitioned to the `ApprovedTransaction` state.
+    choice Approve : ContractId ApprovedTransaction
+      with
+        approver: Party
+        approvalTime: Time
+      controller approver
+      do
+        -- 1. Validate the approver's authority and vote uniqueness.
+        assertMsg "Controller is not a designated approver for this policy" $
+          Set.member approver policy.approvers
+        assertMsg "Approver has already approved this transaction" $
+          not $ Set.member approver approvals
+
+        -- 2. Atomically add the new approval.
+        let newApprovals = Set.insert approver approvals
+        let numApprovals = Set.size newApprovals
+
+        -- 3. Check all relevant rules for the target asset.
+        let rules = policy.getRulesFor payload.assetId
+        let quorumMet = all (\(Quorum r) -> numApprovals >= r.requiredApprovals) (getQuorumRules rules)
+        let timeLockPassed = all (\(TimeLock r) -> approvalTime `subTime` creationTime >= r.delay) (getTimeLockRules rules)
+        let whitelistMet = all (\(Whitelist r) -> Set.member payload.destination r.allowedDestinations) (getWhitelistRules rules)
+
+        -- This choice directly creates an ApprovedTransaction, so all checks must pass now.
+        -- A more complex workflow could use intermediate states, but this atomic check is robust.
+        assertMsg ("Quorum not met. Required: " <> show (map (.requiredApprovals) (getQuorumRules rules)) <> ", Have: " <> show numApprovals) quorumMet
+        assertMsg "Time lock period has not passed" timeLockPassed
+        assertMsg "Destination is not on the whitelist" whitelistMet
+
+        -- 4. If all checks pass, archive this pending contract and create the final,
+        -- immutable proof of approval.
+        create ApprovedTransaction with
+          custodian = policy.custodian
+          owner = policy.owner
+          payload = payload
+          approvalInfo = ApprovalInfo with
+            proposer
+            finalApprovers = newApprovals
+            proposalTime = creationTime
+            finalApprovalTime = approvalTime
+
+    -- | Allows the proposer or the asset owner to cancel the transaction before it is finalized.
+    choice Cancel : ()
+      controller proposer, policy.owner
+      do pure ()
+
+-- Helper functions to extract specific rule types from a list of rules.
+getQuorumRules : [Rule] -> [QuorumRule]
+getQuorumRules = mapMaybe (\case Quorum r -> Some r; _ -> None)
+
+getTimeLockRules : [Rule] -> [TimeLockRule]
+getTimeLockRules = mapMaybe (\case TimeLock r -> Some r; _ -> None)
+
+getWhitelistRules : [Rule] -> [WhitelistRule]
+getWhitelistRules = mapMaybe (\case Whitelist r -> Some r; _ -> None)
+
+
+-- | Contains metadata about the full approval lifecycle of a transaction.
+data ApprovalInfo = ApprovalInfo
+  { proposer: Party
+  , finalApprovers: Set Party
+  , proposalTime: Time
+  , finalApprovalTime: Time
+  } deriving (Eq, Show, Ord)
+
+-- | An immutable contract representing a fully approved transaction, ready for execution.
+-- This contract serves as an auditable authorization token that can be consumed by a
+-- downstream system (e.g., a settlement engine, a separate trigger, or a connector
+-- to an external blockchain) to execute the transaction.
+template ApprovedTransaction
+  with
+    custodian: Party
+    owner: Party
+    payload: TransactionPayload
+    approvalInfo: ApprovalInfo
+  where
+    signatory custodian
+    observer owner
+
+    key (custodian, owner, payload) : (Party, Party, TransactionPayload)
+    maintainer key._1
+
+    -- | A non-consuming choice for clients to query the details of the approved transaction.
+    nonconsuming choice GetPayload : TransactionPayload
+      controller custodian, owner
+      do return payload
+
+    -- | Consuming choice exercised by an automated process or operator to signify that the
+    -- transaction has been settled. This prevents double-spending of the authorization.
+    -- The execution details should be recorded in a dedicated audit trail.
+    choice MarkAsExecuted : ()
+      with
+        executor: Party         -- ^ The party marking the transaction as executed.
+        executionTime: Time     -- ^ The timestamp of execution.
+        executionRef: Text      -- ^ A reference to the execution (e.g., external transaction ID).
+      controller executor
+      do
+        assertMsg "Executor must be the custodian or a designated operator" $
+          executor == custodian
+        -- In a complete system, this choice would create a contract in the
+        -- `Custody.AuditTrail` module to record the event permanently.
+        pure ()
