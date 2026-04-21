@@ -1,0 +1,54 @@
+-- Copyright (c) 2024 Digital Asset (Switzerland) GmbH and/or its affiliates. All rights reserved.
+-- SPDX-License-Identifier: Apache-2.0
+
+-- | Defines a contract for dispatching webhook notifications to external systems,
+-- | commonly used to alert users about pending actions requiring their attention.
+module Custody.WebhookNotification where
+
+import DA.Time (Time)
+import Custody.PolicyEngine (ApprovalRequest)
+
+-- | A contract representing a webhook notification to be sent to an external system.
+-- |
+-- | This contract is designed to be managed by automation, typically a Daml Trigger.
+-- | When a significant event occurs on the ledger, such as the creation of an
+-- | `ApprovalRequest`, a trigger can create an instance of this `WebhookNotification`
+-- | contract for each relevant party.
+-- |
+-- | An off-ledger service (which can be part of the trigger or a separate process)
+-- | monitors the ledger for these contracts. Upon seeing a new `WebhookNotification`
+-- | contract, the service performs the following actions:
+-- | 1. Reads the contract's data (`url`, `payload`).
+-- | 2. Makes an HTTP POST request to the specified `url` with the `payload`.
+-- | 3. After a successful dispatch, archives this contract to mark it as processed.
+-- |
+-- | This pattern provides a reliable, auditable, and idempotent mechanism for
+-- | integrating Daml workflows with external notification systems like Slack, PagerDuty,
+-- | or custom APIs.
+template WebhookNotification
+  with
+    operator: Party
+      -- ^ The party running the notification automation (e.g., the trigger service).
+      -- ^ This party is responsible for dispatching the webhook.
+    recipient: Party
+      -- ^ The party who is the intended recipient of the notification. They are an
+      -- ^ observer on this contract, providing an audit trail that a notification
+      -- ^ was queued for them.
+    requestId: ContractId ApprovalRequest
+      -- ^ The contract ID of the `ApprovalRequest` this notification pertains to.
+      -- ^ This provides a direct, verifiable link to the on-ledger action.
+    url: Text
+      -- ^ The HTTP/S endpoint to which the notification payload should be sent.
+    payload: Text
+      -- ^ The JSON payload to be sent in the webhook's POST request body.
+      -- ^ The content is determined by the trigger that creates this contract.
+    createdAt: Time
+      -- ^ The timestamp of when the notification request was created on the ledger.
+  where
+    signatory operator
+    observer recipient
+
+    ensure url /= ""
+
+    key (operator, recipient, requestId) : (Party, Party, ContractId ApprovalRequest)
+    maintainer key._1
