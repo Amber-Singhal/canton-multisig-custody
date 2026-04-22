@@ -1,0 +1,257 @@
+-- Copyright (c) 2024 Digital Asset (Switzerland) GmbH and/or its affiliates. All rights reserved.
+-- SPDX-License-Identifier: Apache-2.0
+
+module Custody.Test.PolicyTest where
+
+import Daml.Script
+import DA.Date as Date
+import DA.Time as Time
+import DA.Assert ((===), assertMsg)
+
+import Custody.PolicyEngine
+
+-- === Test Setup ===
+
+-- | A standard set of parties for use in tests.
+setupParties = script do
+  custodian <- allocatePartyWithHint "Custodian" (PartyIdHint "custodian")
+  client <- allocatePartyWithHint "Client" (PartyIdHint "client")
+  approver1 <- allocatePartyWithHint "Approver1" (PartyIdHint "approver1")
+  approver2 <- allocatePartyWithHint "Approver2" (PartyIdHint "approver2")
+  approver3 <- allocatePartyWithHint "Approver3" (PartyIdHint "approver3")
+  manager1 <- allocatePartyWithHint "Manager1" (PartyIdHint "manager1")
+  manager2 <- allocatePartyWithHint "Manager2" (PartyIdHint "manager2")
+  return (custodian, client, approver1, approver2, approver3, manager1, manager2)
+
+-- | The main test suite that runs all policy-related tests.
+policyTests = script do
+  testRuleOverride
+  testDecisionEscalation
+  testPolicyExpiry
+
+-- === Test Cases ===
+
+-- |
+-- Test that a more specific policy rule overrides a more general one when
+-- evaluating a transaction request.
+testRuleOverride = script do
+  (custodian, client, approver1, approver2, approver3, _, _) <- setupParties
+  p "testRuleOverride: Testing that specific rules correctly override general ones."
+
+  let
+    -- General rule: any BTC withdrawal under 1M needs 1 approver.
+    generalRule = PolicyRule with
+      id = "GENERAL_WITHDRAWAL_BTC"
+      description = "Standard BTC withdrawals under $1M"
+      ruleFilter = RuleFilter with
+        asset = Some "BTC"
+        minAmount = None
+        maxAmount = Some 1_000_000.0
+        counterparty = None
+      requiredApprovals = 1
+      approverSet = [approver1, approver2, approver3]
+      escalation = None
+
+    -- Specific rule: withdrawals to "HighRiskExchange" need 3 approvers,
+    -- regardless of amount. This should take precedence.
+    specificRule = PolicyRule with
+      id = "HIGH_RISK_COUNTERPARTY"
+      description = "Withdrawals to High Risk Exchange"
+      ruleFilter = RuleFilter with
+        asset = Some "BTC"
+        minAmount = None
+        maxAmount = None
+        counterparty = Some "HighRiskExchange"
+      requiredApprovals = 3
+      approverSet = [approver1, approver2, approver3]
+      escalation = None
+
+  now <- getTime
+  policyCid <- submit custodian do
+    createCmd Policy with
+      id = "CLIENT_A_POLICY"
+      custodian
+      client
+      -- Order matters: rules are evaluated first to last.
+      -- Specific rule is placed first to ensure it's matched first.
+      rules = [specificRule, generalRule]
+      observers = []
+      validFrom = Time.toDateUTC now
+      validUntil = Date.addDays (Time.toDateUTC now) 365
+
+  -- Case 1: General withdrawal that does not match the specific rule.
+  p "- Evaluating a standard transaction..."
+  let generalRequest = TransactionRequest with
+        id = "tx-gen-001"
+        asset = "BTC"
+        amount = 500_000.0
+        destination = "bc1q-some-regular-address"
+        counterparty = Some "BenignExchange"
+
+  decisionCid1 <- submit custodian do
+    exerciseCmd policyCid EvaluateTransaction with request = generalRequest
+  decision1 <- fetch decisionCid1
+  decision1.requiredApprovals === 1
+  decision1.pendingApprovers === [approver1, approver2, approver3]
+  p "- OK: Standard transaction correctly required 1 approval."
+
+  -- Case 2: Withdrawal to the high-risk counterparty. Should match the specific rule.
+  p "- Evaluating a transaction to a high-risk counterparty..."
+  let specificRequest = TransactionRequest with
+        id = "tx-spec-002"
+        asset = "BTC"
+        amount = 100_000.0 -- Amount is within general rule's limit
+        destination = "bc1q-high-risk-address"
+        counterparty = Some "HighRiskExchange"
+
+  decisionCid2 <- submit custodian do
+    exerciseCmd policyCid EvaluateTransaction with request = specificRequest
+  decision2 <- fetch decisionCid2
+  decision2.requiredApprovals === 3
+  decision2.pendingApprovers === [approver1, approver2, approver3]
+  p "- OK: High-risk transaction correctly required 3 approvals."
+
+  return ()
+
+-- |
+-- Test that a pending transaction decision escalates to a higher approval
+-- tier after a specified timeout period has passed.
+testDecisionEscalation = script do
+  (custodian, client, approver1, approver2, _, manager1, manager2) <- setupParties
+  p "testDecisionEscalation: Testing time-based escalation of approval requests."
+
+  let
+    tier1Approvers = [approver1, approver2]
+    tier2Approvers = [manager1, manager2]
+    escalationPolicy = EscalationPolicy with
+      timeoutSeconds = 3600 -- 1 hour
+      requiredApprovals = 2
+      approverSet = tier2Approvers
+
+    ruleWithEscalation = PolicyRule with
+      id = "TIERED_APPROVAL_ETH"
+      description = "Large ETH withdrawals with manager escalation"
+      ruleFilter = RuleFilter with
+        asset = Some "ETH"
+        minAmount = Some 100.0
+        maxAmount = None
+        counterparty = None
+      requiredApprovals = 1
+      approverSet = tier1Approvers
+      escalation = Some escalationPolicy
+
+  now <- getTime
+  policyCid <- submit custodian do
+    createCmd Policy with
+      id = "CLIENT_B_ESCALATION_POLICY"
+      custodian
+      client
+      rules = [ruleWithEscalation]
+      observers = []
+      validFrom = Time.toDateUTC now
+      validUntil = Date.addDays (Time.toDateUTC now) 365
+
+  p "- Creating an initial transaction decision..."
+  let request = TransactionRequest with
+        id = "tx-esc-003"
+        asset = "ETH"
+        amount = 500.0
+        destination = "0x...SomeEthAddress"
+        counterparty = None
+
+  decisionCid <- submit custodian do
+    exerciseCmd policyCid EvaluateTransaction with request = request
+
+  decision <- fetch decisionCid
+  decision.requiredApprovals === 1
+  decision.pendingApprovers === tier1Approvers
+  p "- OK: Initial decision created for Tier 1 approvers."
+
+  -- Advance time past the escalation timeout and exercise the Escalate choice
+  p "- Advancing time beyond the 1-hour escalation window..."
+  let newTime = Time.addRelTime now (Time.seconds 3601)
+  setTime newTime
+
+  p "- Escalating the decision..."
+  escalatedDecisionCid <- submit custodian do
+    exerciseCmd decisionCid Escalate
+
+  -- Verify the new escalated decision contract
+  escalatedDecision <- fetch escalatedDecisionCid
+  escalatedDecision.requiredApprovals === 2
+  escalatedDecision.pendingApprovers === tier2Approvers
+  escalatedDecision.isEscalated === True
+  p "- OK: New decision created with Tier 2 approvers."
+
+  -- Verify the original decision was consumed
+  p "- Verifying original decision was archived..."
+  fetch decisionCid `shouldFail` pure ()
+  p "- OK: Original decision successfully archived."
+
+  return ()
+
+-- |
+-- Test that a `Policy` contract's validity period is enforced. An expired
+-- policy should not be usable, and can be archived.
+testPolicyExpiry = script do
+  (custodian, client, approver1, _, _, _, _) <- setupParties
+  p "testPolicyExpiry: Testing the lifecycle and expiry of a policy."
+
+  now <- getTime
+  let
+    pastDate = Date.addDays (Time.toDateUTC now) (-10)
+    wayPastDate = Date.addDays (Time.toDateUTC now) (-20)
+
+  -- Case 1: Create an already-expired policy and try to use it.
+  p "- Creating an already-expired policy..."
+  expiredPolicyCid <- submit custodian do
+    createCmd Policy with
+      id = "EXPIRED_POLICY"
+      custodian
+      client
+      rules = []
+      observers = []
+      validFrom = wayPastDate
+      validUntil = pastDate
+
+  let request = TransactionRequest with
+        id = "tx-exp-004"
+        asset = "USDC"
+        amount = 1000.0
+        destination = "0x...some-addr"
+        counterparty = None
+
+  p "- Attempting to use the expired policy (should fail)..."
+  submit custodian (exerciseCmd expiredPolicyCid EvaluateTransaction with request = request) `shouldFail` pure ()
+  p "- OK: Evaluation correctly failed for an expired policy."
+
+  -- Case 2: Create a policy that will expire, then advance time and archive it.
+  p "- Creating a policy that will soon expire..."
+  let almostExpiredPolicy = Policy with
+        id = "ALMOST_EXPIRED_POLICY"
+        custodian
+        client
+        rules = []
+        observers = []
+        validFrom = wayPastDate
+        validUntil = Date.addDays (Time.toDateUTC now) 1
+
+  almostExpiredPolicyCid <- submit custodian do createCmd almostExpiredPolicy
+
+  p "- Attempting to expire the policy before its time (should fail)..."
+  submit custodian (exerciseCmd almostExpiredPolicyCid Expire) `shouldFail` pure ()
+  p "- OK: Policy could not be expired prematurely."
+
+  p "- Advancing time past the expiry date..."
+  let futureTime = Time.addRelTime now (Time.days 2)
+  setTime futureTime
+
+  p "- Archiving the now-expired policy..."
+  submit custodian do
+    exerciseCmd almostExpiredPolicyCid Expire
+
+  p "- Verifying the policy contract was archived..."
+  fetch almostExpiredPolicyCid `shouldFail` pure ()
+  p "- OK: Expired policy successfully archived."
+
+  return ()
